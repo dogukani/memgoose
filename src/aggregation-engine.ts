@@ -341,13 +341,15 @@ export class AggregationEngine<T extends object = Record<string, unknown>> {
         if (field === '_id') continue // Handle separately
 
         if (spec === 1) {
-          // Include field
-          projected[field] = doc[field]
+          // Include field — a missing source field stays missing (MongoDB semantics)
+          const value = field.includes('.') ? this.walkFieldPath(doc, field.split('.')) : doc[field]
+          if (value !== undefined) projected[field] = value
         } else if (spec === 0) {
           // Exclude field (will be handled below)
         } else {
-          // Expression
-          projected[field] = this.evaluateExpression(spec, doc)
+          // Expression — "missing" results do not create the field
+          const value = this.evaluateExpression(spec, doc)
+          if (value !== undefined) projected[field] = value
         }
       }
 
@@ -387,6 +389,59 @@ export class AggregationEngine<T extends object = Record<string, unknown>> {
           return typeof s === 'number' && Number.isFinite(s) ? s : null
         }
         throw new Error(`memgoose: unsupported $meta value "${meta}"`)
+      }
+
+      if ('$let' in expr) {
+        const letExpr = (expr as { $let: { vars: Record<string, unknown>; in: unknown } }).$let
+        const scoped: AggregationResult = { ...doc }
+        for (const [name, valueExpr] of Object.entries(letExpr.vars ?? {})) {
+          scoped[`$$${name}`] = this.evaluateExpression(valueExpr as ProjectionExpression, doc)
+        }
+        return this.evaluateExpression(letExpr.in as ProjectionExpression, scoped)
+      }
+
+      // Comparison operators (expression form, used inside $filter/$cond/$switch)
+      if ('$eq' in expr) {
+        const [a, b] = (expr as { $eq: [unknown, unknown] }).$eq
+        return this.expressionEquals(
+          this.evaluateExpression(a as ProjectionExpression, doc),
+          this.evaluateExpression(b as ProjectionExpression, doc)
+        )
+      }
+      if ('$ne' in expr) {
+        const [a, b] = (expr as { $ne: [unknown, unknown] }).$ne
+        return !this.expressionEquals(
+          this.evaluateExpression(a as ProjectionExpression, doc),
+          this.evaluateExpression(b as ProjectionExpression, doc)
+        )
+      }
+      if ('$gt' in expr && Array.isArray((expr as { $gt: unknown }).$gt)) {
+        const [a, b] = (expr as { $gt: [unknown, unknown] }).$gt
+        return this.compareValues(a, b, doc) > 0
+      }
+      if ('$gte' in expr && Array.isArray((expr as { $gte: unknown }).$gte)) {
+        const [a, b] = (expr as { $gte: [unknown, unknown] }).$gte
+        return this.compareValues(a, b, doc) >= 0
+      }
+      if ('$lt' in expr && Array.isArray((expr as { $lt: unknown }).$lt)) {
+        const [a, b] = (expr as { $lt: [unknown, unknown] }).$lt
+        return this.compareValues(a, b, doc) < 0
+      }
+      if ('$lte' in expr && Array.isArray((expr as { $lte: unknown }).$lte)) {
+        const [a, b] = (expr as { $lte: [unknown, unknown] }).$lte
+        return this.compareValues(a, b, doc) <= 0
+      }
+      if ('$and' in expr && Array.isArray((expr as { $and: unknown }).$and)) {
+        return (expr as { $and: unknown[] }).$and.every(e =>
+          this.evaluateCondition(e, doc)
+        )
+      }
+      if ('$or' in expr && Array.isArray((expr as { $or: unknown }).$or)) {
+        return (expr as { $or: unknown[] }).$or.some(e => this.evaluateCondition(e, doc))
+      }
+      if ('$not' in expr) {
+        const inner = (expr as { $not: unknown }).$not
+        return !this.evaluateCondition(Array.isArray(inner) ? inner[0] : inner, doc)
       }
 
       if ('$concat' in expr) {
@@ -1210,7 +1265,9 @@ export class AggregationEngine<T extends object = Record<string, unknown>> {
     if (typeof condition === 'string') {
       return !!this.resolveFieldPath(doc, condition)
     }
-    // Could extend this to support more complex conditions
+    if (typeof condition === 'object' && condition !== null) {
+      return !!this.evaluateExpression(condition as ProjectionExpression, doc)
+    }
     return !!condition
   }
 
@@ -1328,12 +1385,11 @@ export class AggregationEngine<T extends object = Record<string, unknown>> {
     return data.map(doc => {
       const added = { ...doc }
       for (const [field, expr] of Object.entries(fields)) {
-        // Support both simple field refs and complex expressions
-        if (typeof expr === 'object' && expr !== null && !Array.isArray(expr)) {
-          added[field] = this.evaluateExpression(expr as ProjectionExpression, doc)
-        } else {
-          added[field] = expr
-        }
+        // Every form goes through the expression engine: '$path' refs resolve,
+        // literals pass through, operator objects evaluate. A "missing" result
+        // (undefined) does not create the field — MongoDB semantics.
+        const value = this.evaluateExpression(expr as ProjectionExpression, doc)
+        if (value !== undefined) added[field] = value
       }
       return added
     })
@@ -1383,22 +1439,63 @@ export class AggregationEngine<T extends object = Record<string, unknown>> {
   private resolveFieldPath(doc: AggregationResult, path: string): unknown {
     if (!path.startsWith('$')) return path
 
-    // Handle $$variable references (like $$value, $$this)
+    // Handle $$variable references (like $$value, $$this, $$active.company_name)
     if (path.startsWith('$$')) {
-      const varName = path.slice(2)
-      return (doc as Record<string, unknown>)[`$$${varName}`] ?? doc[varName]
+      const [varName, ...rest] = path.slice(2).split('.')
+      const record = doc as Record<string, unknown>
+      const base = record[`$$${varName}`] !== undefined ? record[`$$${varName}`] : doc[varName]
+      return rest.length > 0 ? this.walkFieldPath(base, rest) : base
     }
 
     const fieldPath = path.slice(1) // Remove $
     const parts = fieldPath.split('.')
 
-    let value: unknown = doc
-    for (const part of parts) {
-      if (value === null || value === undefined) return undefined
-      value = (value as Record<string, unknown>)[part]
-    }
+    const value: unknown = this.walkFieldPath(doc, parts)
 
     return value
+  }
+
+  /** Walk a dotted path; array segments project across elements (MongoDB path semantics). */
+  private walkFieldPath(value: unknown, parts: string[]): unknown {
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
+      if (value === null || value === undefined) return undefined
+      if (Array.isArray(value)) {
+        const idx = Number(part)
+        if (Number.isInteger(idx) && String(idx) === part) {
+          value = value[idx]
+          continue
+        }
+        const rest = parts.slice(i)
+        return value.map(el => this.walkFieldPath(el, rest)).filter(v => v !== undefined)
+      }
+      if (typeof value !== 'object') return undefined
+      value = (value as Record<string, unknown>)[part]
+    }
+    return value
+  }
+
+  /** Equality for expression operators: null==undefined, Date/ObjectId aware, deep for arrays/objects. */
+  private expressionEquals(a: unknown, b: unknown): boolean {
+    if (a === b) return true
+    if ((a === null || a === undefined) && (b === null || b === undefined)) return true
+    if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime()
+    if (a instanceof ObjectId || b instanceof ObjectId) return String(a) === String(b)
+    if (typeof a === 'object' && typeof b === 'object' && a !== null && b !== null) {
+      return JSON.stringify(a) === JSON.stringify(b)
+    }
+    return false
+  }
+
+  /** Three-way comparison for expression $gt/$gte/$lt/$lte; NaN-safe (returns NaN → all false). */
+  private compareValues(aExpr: unknown, bExpr: unknown, doc: AggregationResult): number {
+    const a = this.evaluateExpression(aExpr as ProjectionExpression, doc)
+    const b = this.evaluateExpression(bExpr as ProjectionExpression, doc)
+    if (typeof a === 'string' && typeof b === 'string') return a.localeCompare(b)
+    const an = a instanceof Date ? a.getTime() : Number(a)
+    const bn = b instanceof Date ? b.getTime() : Number(b)
+    if (Number.isNaN(an) || Number.isNaN(bn)) return NaN
+    return an - bn
   }
 
   private bucket(data: AggregationResult[], bucketStage: BucketStage): AggregationResult[] {
