@@ -866,8 +866,8 @@ if (connection.readyState === STATES.connected) {
 
 Frozen map of mongoose-compatible `readyState` values:
 `{ disconnected: 0, connected: 1, connecting: 2, disconnecting: 3, uninitialized: 99 }`.
-memgoose connects synchronously, so `connecting`/`disconnecting` are never
-reported.
+memgoose connects synchronously, so `connecting` is never reported;
+`disconnecting` is observable while `disconnect()` awaits storage flushes.
 
 ### `async disconnect()`
 

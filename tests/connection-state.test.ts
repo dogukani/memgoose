@@ -44,16 +44,19 @@ test('connection readyState', async t => {
     }
   )
 
-  await t.test('disconnect() moves it back to disconnected and emits', async () => {
+  await t.test('disconnect() reports disconnecting, then disconnected, and emits', async () => {
     const events: string[] = []
     connection.once('disconnected', () => events.push('disconnected'))
     connection.once('close', () => events.push('close'))
-    await disconnect()
+    const inFlight = disconnect()
+    assert.strictEqual(connection.readyState, STATES.disconnecting)
+    await inFlight
     assert.strictEqual(connection.readyState, STATES.disconnected)
     assert.deepStrictEqual(events, ['disconnected', 'close'])
   })
 
   await t.test('double disconnect is idempotent and emits once', async () => {
+    connect({ storage: 'memory' })
     let emissions = 0
     const count = () => {
       emissions += 1
@@ -63,7 +66,7 @@ test('connection readyState', async t => {
     await disconnect()
     connection.off('disconnected', count)
     assert.strictEqual(connection.readyState, STATES.disconnected)
-    assert.strictEqual(emissions, 0)
+    assert.strictEqual(emissions, 1)
   })
 
   await t.test('reconnecting works and close() is a disconnect alias', async () => {

@@ -14,9 +14,8 @@ let readyState = 0
 
 /**
  * Mongoose-compatible readyState values (like mongoose.STATES).
- * memgoose connects synchronously, so 'connecting'/'disconnecting' are never
- * reported — they exist so comparisons against STATES members type-check and
- * behave as with mongoose.
+ * memgoose connects synchronously, so 'connecting' is never reported;
+ * 'disconnecting' is observable while disconnect() awaits storage flushes.
  */
 export const STATES = Object.freeze({
   disconnected: 0,
@@ -136,16 +135,23 @@ export async function clearRegistry(): Promise<void> {
  */
 export async function disconnect(): Promise<void> {
   const database = defaultDatabase
+  const wasConnected = readyState === STATES.connected
+  // Storage flushes make disconnect genuinely asynchronous — report the
+  // 'disconnecting' state while they are in flight.
+  if (wasConnected) readyState = STATES.disconnecting
   try {
     await database.disconnect()
   } finally {
     // Only reset when no newer connect() replaced the database while this
     // disconnect was in flight; a failed disconnect still ends disconnected
-    // (mongoose reaches 'disconnected' even on forced close).
-    if (defaultDatabase === database && readyState !== 0) {
-      readyState = 0
-      connection.emit('disconnected')
-      connection.emit('close')
+    // (mongoose reaches 'disconnected' even on forced close). Events fire
+    // only on a genuine connected → disconnected transition.
+    if (defaultDatabase === database && readyState !== STATES.disconnected) {
+      readyState = STATES.disconnected
+      if (wasConnected) {
+        connection.emit('disconnected')
+        connection.emit('close')
+      }
     }
   }
 }
