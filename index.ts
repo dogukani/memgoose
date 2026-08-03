@@ -78,6 +78,8 @@ import { TTLManager as _TTLManager } from './src/ttl-manager'
 export const TTLManager = _TTLManager
 import {
   connect as _connect,
+  connection as _connection,
+  STATES as _STATES,
   createDatabase as _createDatabase,
   model as _model,
   getModel as _getModel,
@@ -87,6 +89,8 @@ import {
   getDefaultDatabase as _getDefaultDatabase
 } from './src/connection'
 export const connect = _connect
+export const connection = _connection
+export const STATES = _STATES
 export const createDatabase = _createDatabase
 export const model = _model
 export const getModel = _getModel
@@ -129,6 +133,8 @@ const memgoose = {
   Database: _Database,
   TTLManager: _TTLManager,
   connect: _connect,
+  connection: _connection,
+  STATES: _STATES,
   createDatabase: _createDatabase,
   model: _model,
   getModel: _getModel,
